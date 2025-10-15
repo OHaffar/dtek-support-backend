@@ -2,16 +2,14 @@
 const express = require('express');
 const cors = require('cors');
 const { Client } = require('@notionhq/client');
-const crypto = require('crypto');
 
 const {
   NOTION_TOKEN,
-  DATABASE_ID,
-  ASSIGNEE_USER_IDS // optional: "id1,id2,id3"
+  DATABASE_ID
 } = process.env;
 
 if (!NOTION_TOKEN || !DATABASE_ID) {
-  console.error('Missing NOTION_TOKEN or DATABASE_ID');
+  console.error('❌ Missing NOTION_TOKEN or DATABASE_ID');
   process.exit(1);
 }
 
@@ -22,7 +20,56 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// --- helpers ---
+// 🧩 OPERATIONS TEAM (User ID to Name)
+const USER_ID_TO_NAME = {
+  'c0ccc544-c4c3-4a32-9d3b-23a500383b0b': 'Brazil',
+  '080c42c6-fbb2-47d6-9774-1d086c7c3210': 'Nishanth',
+  'ff3909f8-9fa8-4013-9d12-c1e86f8ebffe': 'Chethan',
+  'ec6410cf-b2cb-4ea8-8539-fb973e00a028': 'Derrick'
+};
+
+// ✅ pickNextAssignee: finds who gets the next ticket
+async function pickNextAssignee() {
+  const userIds = Object.keys(USER_ID_TO_NAME);
+
+  // 1️⃣ Get all current open tickets (not Done)
+  const pages = await notion.databases.query({
+    database_id: DATABASE_ID,
+    filter: {
+      and: [
+        { property: 'Status', select: { does_not_equal: 'Done' } },
+        { property: 'Assigned To', people: { is_not_empty: true } }
+      ]
+    }
+  });
+
+  // 2️⃣ Count how many each person has
+  const counts = {};
+  for (const id of userIds) counts[id] = 0;
+
+  for (const page of pages.results) {
+    const assigned = page.properties['Assigned To']?.people || [];
+    if (assigned.length > 0) {
+      const id = assigned[0].id;
+      if (counts[id] !== undefined) counts[id]++;
+    }
+  }
+
+  // 3️⃣ Find anyone with fewer than 2 open tickets
+  for (const id of userIds) {
+    if ((counts[id] || 0) < 2) {
+      console.log(`🧠 Assigning to ${USER_ID_TO_NAME[id]} (currently ${counts[id] || 0} open)`);
+      return id;
+    }
+  }
+
+  // 4️⃣ Everyone has 2+ tickets → restart with Brazil
+  const first = userIds[0];
+  console.log(`♻️ All busy — assigning to ${USER_ID_TO_NAME[first]} by rotation`);
+  return first;
+}
+
+// 🧱 VALIDATION HELPERS
 const VALID_CATEGORY = new Set(['Hardware', 'Software', 'Payment', 'Network', 'Other']);
 const VALID_SEVERITY = new Set(['S1', 'S2', 'S3', 'S4']);
 const VALID_PRIORITY = new Set(['P1', 'P2', 'P3', 'P4']);
@@ -33,16 +80,7 @@ function normalizeSelect(value, validSet, fallback) {
   return validSet.has(v) ? v : fallback;
 }
 
-function pickAssigneeIdRoundRobin(customerStr) {
-  if (!ASSIGNEE_USER_IDS) return null;
-  const ids = ASSIGNEE_USER_IDS.split(',').map(s => s.trim()).filter(Boolean);
-  if (ids.length === 0) return null;
-  const key = (customerStr || 'fallback') + ':' + Date.now().toString().slice(0, -4);
-  const h = crypto.createHash('sha1').update(key).digest('hex');
-  const idx = parseInt(h.slice(0, 6), 16) % ids.length;
-  return ids[idx];
-}
-
+// 🏗️ Create Notion page
 async function createNotionPage({
   issueSummary,
   customer,
@@ -57,7 +95,8 @@ async function createNotionPage({
   const sev = normalizeSelect(severity, VALID_SEVERITY, 'S3');
   const pri = normalizeSelect(priority, VALID_PRIORITY, 'P3');
 
-  const assignedId = pickAssigneeIdRoundRobin(customer || location || '');
+  // 🧠 Auto-assign
+  const assignedId = await pickNextAssignee();
 
   const properties = {
     'Issue Title': {
@@ -90,22 +129,14 @@ async function createNotionPage({
         text: {
           content: isTest
             ? `Intake: Automated connectivity test @ ${new Date().toISOString()}`
-            : `Intake: ${[
-                issueSummary ? `Issue: ${issueSummary}` : null,
-                customer ? `Customer: ${customer}` : null,
-                location ? `Location: ${location}` : null,
-                category ? `Category: ${cat}` : null,
-                severity ? `Severity: ${sev}` : null,
-                priority ? `Priority: ${pri}` : null
-              ].filter(Boolean).join(' | ')}`
+            : `Intake: Issue: ${issueSummary} | Customer: ${customer} | Location: ${location} | Category: ${cat} | Severity: ${sev} | Priority: ${pri}`
         }
       }]
+    },
+    'Assigned To': {
+      people: [{ id: assignedId }]
     }
   };
-
-  if (assignedId) {
-    properties['Assigned To'] = { people: [{ id: assignedId }] };
-  }
 
   return await notion.pages.create({
     parent: { database_id: DATABASE_ID },
@@ -113,7 +144,7 @@ async function createNotionPage({
   });
 }
 
-// --- routes ---
+// 🌐 ROUTES
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'dtek-support-backend' });
 });
@@ -189,5 +220,5 @@ app.post('/api/create-ticket', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`SWIFT backend listening on :${PORT}`);
+  console.log(`✅ SWIFT backend listening on :${PORT}`);
 });
