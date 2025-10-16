@@ -4,7 +4,6 @@ const cors = require('cors');
 const { Client } = require('@notionhq/client');
 
 const { NOTION_TOKEN, DATABASE_ID } = process.env;
-
 if (!NOTION_TOKEN || !DATABASE_ID) {
   console.error('❌ Missing NOTION_TOKEN or DATABASE_ID');
   process.exit(1);
@@ -92,19 +91,12 @@ async function createNotionPage({
   const sev = normalizeSelect(severity, VALID_SEVERITY, 'S3');
   const pri = normalizeSelect(priority, VALID_PRIORITY, 'P3');
 
-  // Auto-assign based on open-ticket load
   const assignedId = await pickNextAssignee();
 
   const properties = {
-    'Issue Title': {
-      title: [{ type: 'text', text: { content: title } }]
-    },
-    'Customer/ Tenant': {
-      rich_text: [{ type: 'text', text: { content: customer || '' } }]
-    },
-    'Location': {
-      rich_text: [{ type: 'text', text: { content: location || customer || '' } }]
-    },
+    'Issue Title': { title: [{ type: 'text', text: { content: title } }] },
+    'Customer/ Tenant': { rich_text: [{ type: 'text', text: { content: customer || '' } }] },
+    'Location': { rich_text: [{ type: 'text', text: { content: location || customer || '' } }] },
     'Category': { select: { name: cat } },
     'Severity': { select: { name: sev } },
     'Priority': { select: { name: pri } },
@@ -117,13 +109,26 @@ async function createNotionPage({
     // Assign to chosen teammate
     'Assigned To': { people: [{ id: assignedId }] }
 
-    // Note: "Date Reported" is a Created time property in Notion, so we don't set it here.
+    // Note: "Date Reported" is a Created time property in Notion (no code needed).
     // "Ticket ID" and "Resolution Time (hrs)" are formulas in Notion.
   };
 
   return await notion.pages.create({
     parent: { database_id: DATABASE_ID },
     properties
+  });
+}
+
+/* ---------------------- Mark ticket as resolved (freeze) --------------- */
+async function markTicketResolved(pageId) {
+  const nowISO = new Date().toISOString();
+  return await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      'Customer informed': { checkbox: true },
+      'Resolved Date': { date: { start: nowISO } }, // fixed timestamp
+      'Status': { select: { name: 'Done' } }
+    }
   });
 }
 
@@ -194,7 +199,19 @@ app.post('/api/create-ticket', async (req, res) => {
   }
 });
 
+// Body: { "pageId": "<notion_page_id>" }
+app.post('/api/mark-resolved', async (req, res) => {
+  try {
+    const { pageId } = req.body || {};
+    if (!pageId) return res.status(400).json({ ok: false, error: 'pageId is required' });
+    const updated = await markTicketResolved(pageId);
+    res.json({ ok: true, pageId: updated.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: 'Failed to mark resolved', detail: String(err.message || err) });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ SWIFT backend listening on :${PORT}`);
 });
-
