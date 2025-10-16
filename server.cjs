@@ -3,10 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Client } = require('@notionhq/client');
 
-const {
-  NOTION_TOKEN,
-  DATABASE_ID
-} = process.env;
+const { NOTION_TOKEN, DATABASE_ID } = process.env;
 
 if (!NOTION_TOKEN || !DATABASE_ID) {
   console.error('❌ Missing NOTION_TOKEN or DATABASE_ID');
@@ -20,7 +17,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// 🧩 OPERATIONS TEAM (User ID to Name)
+/* ---------------------- Ops team mapping (given) ---------------------- */
 const USER_ID_TO_NAME = {
   'c0ccc544-c4c3-4a32-9d3b-23a500383b0b': 'Brazil',
   '080c42c6-fbb2-47d6-9774-1d086c7c3210': 'Nishanth',
@@ -28,11 +25,11 @@ const USER_ID_TO_NAME = {
   'ec6410cf-b2cb-4ea8-8539-fb973e00a028': 'Derrick'
 };
 
-// ✅ pickNextAssignee: finds who gets the next ticket
+/* --------- Pick next assignee: keep everyone under 2 open --------- */
 async function pickNextAssignee() {
   const userIds = Object.keys(USER_ID_TO_NAME);
 
-  // 1️⃣ Get all current open tickets (not Done)
+  // Fetch tickets that are NOT Done and already assigned
   const pages = await notion.databases.query({
     database_id: DATABASE_ID,
     filter: {
@@ -43,33 +40,33 @@ async function pickNextAssignee() {
     }
   });
 
-  // 2️⃣ Count how many each person has
+  // Count open tickets per user
   const counts = {};
   for (const id of userIds) counts[id] = 0;
 
   for (const page of pages.results) {
-    const assigned = page.properties['Assigned To']?.people || [];
-    if (assigned.length > 0) {
-      const id = assigned[0].id;
+    const people = page.properties['Assigned To']?.people || [];
+    if (people.length > 0) {
+      const id = people[0].id;
       if (counts[id] !== undefined) counts[id]++;
     }
   }
 
-  // 3️⃣ Find anyone with fewer than 2 open tickets
+  // Prefer anyone with < 2 open tickets, in the listed order
   for (const id of userIds) {
     if ((counts[id] || 0) < 2) {
-      console.log(`🧠 Assigning to ${USER_ID_TO_NAME[id]} (currently ${counts[id] || 0} open)`);
+      console.log(`🧠 Assigning to ${USER_ID_TO_NAME[id]} (open: ${counts[id] || 0})`);
       return id;
     }
   }
 
-  // 4️⃣ Everyone has 2+ tickets → restart with Brazil
-  const first = userIds[0];
-  console.log(`♻️ All busy — assigning to ${USER_ID_TO_NAME[first]} by rotation`);
-  return first;
+  // Everyone has 2+ → start cycle from the first (Brazil)
+  const fallback = userIds[0];
+  console.log(`♻️ All have >=2 open; assigning to ${USER_ID_TO_NAME[fallback]}`);
+  return fallback;
 }
 
-// 🧱 VALIDATION HELPERS
+/* ------------------------- Validation helpers ------------------------- */
 const VALID_CATEGORY = new Set(['Hardware', 'Software', 'Payment', 'Network', 'Other']);
 const VALID_SEVERITY = new Set(['S1', 'S2', 'S3', 'S4']);
 const VALID_PRIORITY = new Set(['P1', 'P2', 'P3', 'P4']);
@@ -80,7 +77,7 @@ function normalizeSelect(value, validSet, fallback) {
   return validSet.has(v) ? v : fallback;
 }
 
-// 🏗️ Create Notion page
+/* -------------------------- Create Notion page ------------------------- */
 async function createNotionPage({
   issueSummary,
   customer,
@@ -95,7 +92,7 @@ async function createNotionPage({
   const sev = normalizeSelect(severity, VALID_SEVERITY, 'S3');
   const pri = normalizeSelect(priority, VALID_PRIORITY, 'P3');
 
-  // 🧠 Auto-assign
+  // Auto-assign based on open-ticket load
   const assignedId = await pickNextAssignee();
 
   const properties = {
@@ -108,34 +105,20 @@ async function createNotionPage({
     'Location': {
       rich_text: [{ type: 'text', text: { content: location || customer || '' } }]
     },
-    'Category': {
-      select: { name: cat }
-    },
-    'Severity': {
-      select: { name: sev }
-    },
-    'Priority': {
-      select: { name: pri }
-    },
-    'Status': {
-      select: { name: 'To Do' }
-    },
-    'Customer informed': {
-      checkbox: false
-    },
-    'Maintenance Report': {
-      rich_text: [{
-        type: 'text',
-        text: {
-          content: isTest
-            ? `Intake: Automated connectivity test @ ${new Date().toISOString()}`
-            : `Intake: Issue: ${issueSummary} | Customer: ${customer} | Location: ${location} | Category: ${cat} | Severity: ${sev} | Priority: ${pri}`
-        }
-      }]
-    },
-    'Assigned To': {
-      people: [{ id: assignedId }]
-    }
+    'Category': { select: { name: cat } },
+    'Severity': { select: { name: sev } },
+    'Priority': { select: { name: pri } },
+    'Status': { select: { name: 'To Do' } },
+    'Customer informed': { checkbox: false },
+
+    // Leave maintenance report BLANK for ops to fill after the fix
+    'Maintenance Report': { rich_text: [] },
+
+    // Assign to chosen teammate
+    'Assigned To': { people: [{ id: assignedId }] }
+
+    // Note: "Date Reported" is a Created time property in Notion, so we don't set it here.
+    // "Ticket ID" and "Resolution Time (hrs)" are formulas in Notion.
   };
 
   return await notion.pages.create({
@@ -144,7 +127,7 @@ async function createNotionPage({
   });
 }
 
-// 🌐 ROUTES
+/* -------------------------------- Routes ------------------------------- */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'dtek-support-backend' });
 });
@@ -186,15 +169,7 @@ app.post('/api/create-test-ticket', async (_req, res) => {
 
 app.post('/api/create-ticket', async (req, res) => {
   try {
-    const {
-      issueSummary,
-      customer,
-      location,
-      category,
-      severity,
-      priority
-    } = req.body || {};
-
+    const { issueSummary, customer, location, category, severity, priority } = req.body || {};
     if (!issueSummary) {
       return res.status(400).json({ ok: false, error: 'issueSummary is required' });
     }
@@ -222,3 +197,4 @@ app.post('/api/create-ticket', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ SWIFT backend listening on :${PORT}`);
 });
+
