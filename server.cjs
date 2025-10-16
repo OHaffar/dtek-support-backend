@@ -16,7 +16,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/* ---------------------- Ops team mapping (given) ---------------------- */
+/* ---------------------- Ops team mapping ---------------------- */
 const USER_ID_TO_NAME = {
   'c0ccc544-c4c3-4a32-9d3b-23a500383b0b': 'Brazil',
   '080c42c6-fbb2-47d6-9774-1d086c7c3210': 'Nishanth',
@@ -24,11 +24,9 @@ const USER_ID_TO_NAME = {
   'ec6410cf-b2cb-4ea8-8539-fb973e00a028': 'Derrick'
 };
 
-/* --------- Pick next assignee: keep everyone under 2 open --------- */
+/* --------- Pick next assignee --------- */
 async function pickNextAssignee() {
-  const userIds = Object.keys(USER_ID_TO_NAME);
-
-  // Fetch tickets that are NOT Done and already assigned
+  const ids = Object.keys(USER_ID_TO_NAME);
   const pages = await notion.databases.query({
     database_id: DATABASE_ID,
     filter: {
@@ -39,33 +37,21 @@ async function pickNextAssignee() {
     }
   });
 
-  // Count open tickets per user
   const counts = {};
-  for (const id of userIds) counts[id] = 0;
-
+  ids.forEach(id => (counts[id] = 0));
   for (const page of pages.results) {
     const people = page.properties['Assigned To']?.people || [];
-    if (people.length > 0) {
+    if (people.length) {
       const id = people[0].id;
       if (counts[id] !== undefined) counts[id]++;
     }
   }
 
-  // Prefer anyone with < 2 open tickets, in the listed order
-  for (const id of userIds) {
-    if ((counts[id] || 0) < 2) {
-      console.log(`🧠 Assigning to ${USER_ID_TO_NAME[id]} (open: ${counts[id] || 0})`);
-      return id;
-    }
-  }
-
-  // Everyone has 2+ → start cycle from the first (Brazil)
-  const fallback = userIds[0];
-  console.log(`♻️ All have >=2 open; assigning to ${USER_ID_TO_NAME[fallback]}`);
-  return fallback;
+  const available = ids.find(id => (counts[id] || 0) < 2);
+  return available || ids[0];
 }
 
-/* ------------------------- Validation helpers ------------------------- */
+/* ---------------- Validation helpers ---------------- */
 const VALID_CATEGORY = new Set(['Hardware', 'Software', 'Payment', 'Network', 'Other']);
 const VALID_SEVERITY = new Set(['S1', 'S2', 'S3', 'S4']);
 const VALID_PRIORITY = new Set(['P1', 'P2', 'P3', 'P4']);
@@ -76,7 +62,7 @@ function normalizeSelect(value, validSet, fallback) {
   return validSet.has(v) ? v : fallback;
 }
 
-/* -------------------------- Create Notion page ------------------------- */
+/* ---------------- Create Notion page ---------------- */
 async function createNotionPage({
   issueSummary,
   customer,
@@ -94,89 +80,83 @@ async function createNotionPage({
   const cat = normalizeSelect(category, VALID_CATEGORY, 'Other');
   const sev = normalizeSelect(severity, VALID_SEVERITY, 'S3');
   const pri = normalizeSelect(priority, VALID_PRIORITY, 'P3');
+  const assignee = await pickNextAssignee();
 
-  const assignedId = await pickNextAssignee();
-
-  const properties = {
+  const props = {
     'Issue Title': { title: [{ type: 'text', text: { content: title } }] },
     'Customer/ Tenant': { rich_text: [{ type: 'text', text: { content: customer || '' } }] },
     'Location': { rich_text: [{ type: 'text', text: { content: location || customer || '' } }] },
     'Category': { select: { name: cat } },
     'Severity': { select: { name: sev } },
     'Priority': { select: { name: pri } },
+    'Assigned To': { people: [{ id: assignee }] },
     'Status': { select: { name: 'To Do' } },
     'Customer informed': { checkbox: false },
-
-    // Leave maintenance report BLANK for ops to fill after the fix
-    'Maintenance Report': { rich_text: [] },
-
-    // Assign to chosen teammate
-    'Assigned To': { people: [{ id: assignedId }] }
-    // "Date Reported" is Created time in Notion (no code).
-    // "Ticket ID" & "Resolution Time (hrs)" are formulas in Notion.
+    'Maintenance Report': { rich_text: [] }
   };
 
-  // Optional fields (only set if provided)
-  if (typeof intakeNotes === 'string' && intakeNotes.trim()) {
-    properties['Intake Notes'] = { rich_text: [{ type: 'text', text: { content: intakeNotes } }] };
+  if (intakeNotes) {
+    props['Intake Notes'] = { rich_text: [{ type: 'text', text: { content: intakeNotes } }] };
   }
-  if (typeof barcode === 'string' && barcode.trim()) {
-    properties['Item Barcode'] = { rich_text: [{ type: 'text', text: { content: barcode } }] };
+  if (barcode) {
+    props['Item Barcode'] = { rich_text: [{ type: 'text', text: { content: barcode } }] };
   }
-  if (typeof sessionUrl === 'string' && sessionUrl.trim()) {
-    properties['Session Link'] = { url: sessionUrl };
-  }
-  if (Array.isArray(attachments) && attachments.length > 0) {
-    properties['Attachments'] = {
-      files: attachments.slice(0, 10).map((url) => ({
-        type: 'external',
-        name: (typeof url === 'string' && url.split('/').pop()) || 'attachment',
-        external: { url }
-      }))
-    };
+  if (sessionUrl) {
+    props['Session Link'] = { url: sessionUrl };
   }
 
-  return await notion.pages.create({
+  const page = await notion.pages.create({
     parent: { database_id: DATABASE_ID },
-    properties
+    properties: props
   });
+
+  // Attach uploaded files as Notion file blocks
+  if (attachments && attachments.length > 0) {
+    for (const fileUrl of attachments) {
+      await notion.blocks.children.append({
+        block_id: page.id,
+        children: [
+          {
+            object: 'block',
+            type: 'file',
+            file: { type: 'external', external: { url: fileUrl } }
+          }
+        ]
+      });
+    }
+  }
+
+  return page;
 }
 
-/* ---------------------- Mark ticket as resolved (freeze) --------------- */
+/* ---------------- Mark ticket as resolved ---------------- */
 async function markTicketResolved(pageId) {
   const nowISO = new Date().toISOString();
   return await notion.pages.update({
     page_id: pageId,
     properties: {
       'Customer informed': { checkbox: true },
-      'Resolved Date': { date: { start: nowISO } }, // set date + time
+      'Resolved Date': { date: { start: nowISO } },
       'Status': { select: { name: 'Done' } }
     }
   });
 }
 
-/* -------------------------------- Routes ------------------------------- */
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'dtek-support-backend' });
-});
+/* ---------------- Routes ---------------- */
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'dtek-support-backend' }));
 
-app.get('/test-notion', async (_req, res) => {
+// ✅ For quick DB connection checks if needed later
+app.get('/api/test-notion', async (_req, res) => {
   try {
     const db = await notion.databases.retrieve({ database_id: DATABASE_ID });
-    const propNames = Object.keys(db.properties || {});
-    const hasCategory = propNames.includes('Category');
-    res.json({
-      ok: true,
-      message: 'Notion connection verified and aligned.',
-      properties: propNames,
-      categoryFieldOK: hasCategory
-    });
+    res.json({ ok: true, name: db.title?.[0]?.plain_text || 'Customer Tickets' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: 'Notion connection failed', detail: String(err.message || err) });
+    res.status(500).json({ ok: false, error: 'Notion test failed', detail: err.message });
   }
 });
 
+// ✅ For safe connection testing
 app.post('/api/create-test-ticket', async (_req, res) => {
   try {
     const page = await createNotionPage({
@@ -191,63 +171,40 @@ app.post('/api/create-test-ticket', async (_req, res) => {
     res.json({ ok: true, notion_page_id: page.id });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: 'Failed to create test ticket', detail: String(err.message || err) });
+    res.status(500).json({ ok: false, error: 'Failed to create test ticket', detail: err.message });
   }
 });
 
+// ✅ Main ticket creation endpoint
 app.post('/api/create-ticket', async (req, res) => {
   try {
-    const {
-      issueSummary,
-      customer,
-      location,
-      category,
-      severity,
-      priority,
-      barcode,
-      intakeNotes,
-      sessionUrl,
-      attachments
-    } = req.body || {};
-
-    if (!issueSummary) {
-      return res.status(400).json({ ok: false, error: 'issueSummary is required' });
-    }
-
-    const page = await createNotionPage({
-      issueSummary,
-      customer,
-      location: location || customer,
-      category,
-      severity,
-      priority,
-      barcode,
-      intakeNotes,
-      sessionUrl,
-      attachments: Array.isArray(attachments) ? attachments : []
-    });
-
+    const page = await createNotionPage(req.body);
     res.json({
       ok: true,
       message: "I've informed our team — they’re actively working on it.",
       notion_page_id: page.id
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: 'Failed to create ticket', detail: String(err.message || err) });
+    console.error('❌ Ticket creation failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to create ticket', detail: err.message });
   }
 });
 
-// Body: { "pageId": "<notion_page_id>" }
+// ✅ Mark as resolved endpoint
 app.post('/api/mark-resolved', async (req, res) => {
   try {
     const { pageId } = req.body || {};
-    if (!pageId) return res.status(400).json({ ok: false, error: 'pageId is required' });
+    if (!pageId)
+      return res.status(400).json({ ok: false, error: 'pageId is required' });
     const updated = await markTicketResolved(pageId);
-    res.json({ ok: true, pageId: updated.id, message: 'Ticket marked as resolved and timer stopped.' });
+    res.json({
+      ok: true,
+      pageId: updated.id,
+      message: 'Ticket marked as resolved and timer stopped.'
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: 'Failed to mark resolved', detail: String(err.message || err) });
+    res.status(500).json({ ok: false, error: 'Failed to mark resolved', detail: err.message });
   }
 });
 
